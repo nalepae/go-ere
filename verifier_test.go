@@ -1,6 +1,6 @@
 //go:build cgo && ((linux && (amd64 || arm64)) || (darwin && arm64))
 
-// Copied from github.com/eth-act/ere v0.17.2, bindings/golang/verifier_test.go. Only the package name and the
+// Copied from github.com/eth-act/ere v0.20.2, bindings/golang/verifier_test.go. Only the package name and the
 // fixture paths changed: the fixtures of crates/verifier/<zkvm>/tests/fixtures are copied under testdata/<zkvm>.
 
 package ere
@@ -10,6 +10,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -22,6 +23,8 @@ var fixtures = []fixture{
 	{"openvm", OpenVM},
 	{"sp1", SP1},
 	{"zisk", Zisk},
+	{"lambdavm", LambdaVM},
+	{"pico", Pico},
 }
 
 // fixtureDir returns the directory holding the fixtures of a zkVM.
@@ -147,13 +150,70 @@ func TestNilVerifier(t *testing.T) {
 
 func TestClosedVerifier(t *testing.T) {
 	dir := fixtureDir(fixtures[0].name)
-	v, err := New(fixtures[0].kind, mustRead(t, filepath.Join(dir, "program_vk.bin")))
+	programVK := mustRead(t, filepath.Join(dir, "program_vk.bin"))
+	proof := mustRead(t, filepath.Join(dir, "proof.bin"))
+	cases := []struct {
+		name  string
+		other func(v *Verifier) *Verifier
+	}{
+		{"close_then_use_same_value", func(v *Verifier) *Verifier { return v }},
+		{"close_then_use_copy", func(v *Verifier) *Verifier { w := *v; return &w }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := New(fixtures[0].kind, programVK)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			other := tc.other(v)
+			v.Close()
+			if _, err := other.Kind(); !errors.Is(err, ErrNullPtr) {
+				t.Fatalf("Kind after Close: got %v, want ErrNullPtr", err)
+			}
+			if _, err := other.Verify(proof); !errors.Is(err, ErrNullPtr) {
+				t.Fatalf("Verify after Close: got %v, want ErrNullPtr", err)
+			}
+			other.Close()
+			v.Close()
+		})
+	}
+}
+
+func TestPanicStatus(t *testing.T) {
+	if err := statusToError(7); !errors.Is(err, ErrPanic) {
+		t.Fatalf("status 7: got %v, want ErrPanic", err)
+	}
+}
+
+func TestCloseDuringVerify(t *testing.T) {
+	dir := fixtureDir("zisk")
+	programVK := mustRead(t, filepath.Join(dir, "program_vk.bin"))
+	proof := mustRead(t, filepath.Join(dir, "proof.bin"))
+	v, err := New(Zisk, programVK)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	v.Close()
-	if _, err := v.Kind(); !errors.Is(err, ErrNullPtr) {
-		t.Fatalf("Kind after Close: got %v, want ErrNullPtr", err)
+	var group sync.WaitGroup
+	started := make(chan struct{}, 8)
+	for i := 0; i < 8; i++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			started <- struct{}{}
+			for j := 0; j < 4; j++ {
+				if _, err := v.Verify(proof); err != nil && !errors.Is(err, ErrNullPtr) {
+					t.Errorf("Verify: got %v, want nil or ErrNullPtr", err)
+				}
+				if _, err := v.Kind(); err != nil && !errors.Is(err, ErrNullPtr) {
+					t.Errorf("Kind: got %v, want nil or ErrNullPtr", err)
+				}
+			}
+		}()
 	}
+	<-started
 	v.Close()
+	group.Wait()
+	if _, err := v.Verify(proof); !errors.Is(err, ErrNullPtr) {
+		t.Fatalf("Verify after Close: got %v, want ErrNullPtr", err)
+	}
 }

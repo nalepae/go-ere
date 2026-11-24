@@ -29,7 +29,7 @@ import (
 )
 
 // ereVersion is the ere release this module ships. The module is tagged with the same version.
-const ereVersion = "0.17.2"
+const ereVersion = "0.20.2"
 
 const (
 	repo   = "eth-act/ere"
@@ -68,7 +68,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	for _, zkVM := range []string{"openvm", "sp1", "zisk"} {
+	for _, zkVM := range []string{"openvm", "sp1", "zisk", "lambdavm", "pico"} {
 		for _, name := range []string{"program_vk.bin", "proof.bin", "public_values.bin"} {
 			copies["crates/verifier/"+zkVM+"/tests/fixtures/"+name] = filepath.Join("testdata", zkVM, name)
 		}

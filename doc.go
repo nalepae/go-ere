@@ -7,6 +7,14 @@
 // without cgo, the package does not compile.
 //
 // A *Verifier may be used from multiple goroutines for concurrent Verify and
-// Kind calls. Close consumes the handle and must not overlap with other calls
-// on the same Verifier.
+// Kind calls. Close waits for the calls in progress on the same Verifier, and
+// a later call returns [ErrNullPtr].
+//
+// # Public values
+//
+// A proof that verifies shows only that the program ran. The caller must
+// compare the public values that Verify returns with the expected bytes.
+//
+//   - OpenVM and ZisK return 256 bytes, the guest output padded with zeros.
+//   - LambdaVM, Pico and SP1 return the guest output.
 package ere

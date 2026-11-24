@@ -83,7 +83,7 @@ Only their package name, build constraint, cgo flags and fixture paths differ.
 
 ## Size
 
-The libraries are large: about 53 MB each for Linux and 22 MB for darwin
+The libraries are large: about 17 MB each for Linux and 32 MB for darwin
 (about 25 MB for the whole module, compressed). Each ere bump adds them to the
 git history again, and GitHub warns about files over 50 MB. Consumers download
 the module once per version.

@@ -1,6 +1,6 @@
 //go:build cgo && ((linux && (amd64 || arm64)) || (darwin && arm64))
 
-// Copied from github.com/eth-act/ere v0.17.2, bindings/golang/verifier.go. Only this header changed: the package
+// Copied from github.com/eth-act/ere v0.20.2, bindings/golang/verifier.go. Only this header changed: the package
 // name, the build constraint restricting it to the platforms with a library under lib/, and the cgo flags, which
 // point at the committed header and library (see link_<goos>_<goarch>.go) instead of the system search paths.
 
@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 	"unsafe"
 )
 
@@ -25,9 +26,11 @@ import (
 type ZkVMKind uint32
 
 const (
-	OpenVM ZkVMKind = 0
-	SP1    ZkVMKind = 1
-	Zisk   ZkVMKind = 2
+	OpenVM   ZkVMKind = 0
+	SP1      ZkVMKind = 1
+	Zisk     ZkVMKind = 2
+	LambdaVM ZkVMKind = 3
+	Pico     ZkVMKind = 4
 )
 
 // String implements [fmt.Stringer].
@@ -39,6 +42,10 @@ func (k ZkVMKind) String() string {
 		return "sp1"
 	case Zisk:
 		return "zisk"
+	case LambdaVM:
+		return "lambdavm"
+	case Pico:
+		return "pico"
 	default:
 		return fmt.Sprintf("unknown(%d)", uint32(k))
 	}
@@ -58,6 +65,9 @@ var (
 	// ErrInternal indicates an unexpected internal condition that reflects a bug
 	// in the binding or the verifier library rather than an invalid argument.
 	ErrInternal = errors.New("ere: internal error")
+	// ErrPanic indicates the verifier code panicked. The caller must treat it as
+	// a rejected proof.
+	ErrPanic = errors.New("ere: verifier panicked")
 )
 
 func statusToError(status C.int32_t) error {
@@ -76,6 +86,8 @@ func statusToError(status C.int32_t) error {
 		return ErrVerify
 	case C.ERE_ERR_INTERNAL:
 		return ErrInternal
+	case C.ERE_ERR_PANIC:
+		return ErrPanic
 	default:
 		return fmt.Errorf("ere: unknown error code %d", int32(status))
 	}
@@ -91,8 +103,15 @@ func bytePtr(buffer []byte) *C.uint8_t {
 }
 
 // Verifier is a handle to a verifier bound to a program verifying key. It is
-// created with [New] and released with [Verifier.Close].
+// created with [New] and released with [Verifier.Close]. A copy of a Verifier
+// shares the handle and its lock with the original.
 type Verifier struct {
+	state *verifierState
+}
+
+// verifierState holds the native handle and the lock that guards it.
+type verifierState struct {
+	mutex  sync.RWMutex
 	handle *C.EreVerifier
 }
 
@@ -110,9 +129,9 @@ func New(kind ZkVMKind, encodedProgramVK []byte) (*Verifier, error) {
 	if err := statusToError(status); err != nil {
 		return nil, err
 	}
-	v := &Verifier{handle: handle}
-	runtime.SetFinalizer(v, (*Verifier).Close)
-	return v, nil
+	state := &verifierState{handle: handle}
+	runtime.SetFinalizer(state, (*verifierState).close)
+	return &Verifier{state: state}, nil
 }
 
 // Verify checks encodedProof against the verifier's program verifying key and
@@ -123,18 +142,24 @@ func New(kind ZkVMKind, encodedProgramVK []byte) (*Verifier, error) {
 // sizes nothing and frees nothing. Empty public values yield an empty, non-nil
 // slice.
 func (v *Verifier) Verify(encodedProof []byte) ([]byte, error) {
-	if v == nil || v.handle == nil {
+	if v == nil || v.state == nil {
+		return nil, ErrNullPtr
+	}
+	state := v.state
+	state.mutex.RLock()
+	defer state.mutex.RUnlock()
+	if state.handle == nil {
 		return nil, ErrNullPtr
 	}
 	var ptr *C.uint8_t
 	var length C.uintptr_t
 	status := C.ere_verifier_verify(
-		v.handle,
+		state.handle,
 		bytePtr(encodedProof), C.uintptr_t(len(encodedProof)),
 		&ptr, &length,
 	)
 	runtime.KeepAlive(encodedProof)
-	runtime.KeepAlive(v)
+	runtime.KeepAlive(state)
 	if err := statusToError(status); err != nil {
 		return nil, err
 	}
@@ -149,25 +174,43 @@ func (v *Verifier) Verify(encodedProof []byte) ([]byte, error) {
 // Kind returns the zkVM kind the verifier was constructed for. It returns
 // [ErrNullPtr] for a nil receiver or a closed verifier.
 func (v *Verifier) Kind() (ZkVMKind, error) {
-	if v == nil || v.handle == nil {
+	if v == nil || v.state == nil {
+		return 0, ErrNullPtr
+	}
+	state := v.state
+	state.mutex.RLock()
+	defer state.mutex.RUnlock()
+	if state.handle == nil {
 		return 0, ErrNullPtr
 	}
 	var output C.uint32_t
-	status := C.ere_verifier_zkvm_kind(v.handle, &output)
-	runtime.KeepAlive(v)
+	status := C.ere_verifier_zkvm_kind(state.handle, &output)
+	runtime.KeepAlive(state)
 	if err := statusToError(status); err != nil {
 		return 0, err
 	}
 	return ZkVMKind(output), nil
 }
 
-// Close releases the underlying verifier. It is safe to call more than once and
-// on a nil receiver.
+// Close releases the underlying verifier after the Verify and Kind calls in
+// progress return. It is safe to call more than once, through a copy, and on a
+// nil receiver.
 func (v *Verifier) Close() {
-	if v == nil || v.handle == nil {
+	if v == nil || v.state == nil {
 		return
 	}
-	C.ere_verifier_free(v.handle)
-	v.handle = nil
-	runtime.SetFinalizer(v, nil)
+	v.state.close()
+}
+
+// close releases the native handle once. The garbage collector also calls it
+// as the finalizer of the state.
+func (state *verifierState) close() {
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+	if state.handle == nil {
+		return
+	}
+	C.ere_verifier_free(state.handle)
+	state.handle = nil
+	runtime.SetFinalizer(state, nil)
 }
